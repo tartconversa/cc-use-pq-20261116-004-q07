@@ -25,9 +25,26 @@ CREATE TABLE IF NOT EXISTS lines (
 CREATE TABLE IF NOT EXISTS specifications (
     spec_id TEXT PRIMARY KEY, grade TEXT NOT NULL, valid_from TEXT NOT NULL,
     valid_to TEXT, sulfur_min TEXT NOT NULL, sulfur_max TEXT NOT NULL,
-    ash_max TEXT NOT NULL, created_revision INTEGER NOT NULL,
-    UNIQUE(grade,valid_from)
+    ash_max TEXT NOT NULL, created_revision INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS specification_revisions (
+    spec_revision INTEGER NOT NULL, grade TEXT NOT NULL,
+    parent_revision INTEGER, reason TEXT NOT NULL, effective_from TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('current','superseded')),
+    created_revision INTEGER NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(grade, spec_revision)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS specification_revision_current
+    ON specification_revisions(grade) WHERE status='current';
+CREATE TABLE IF NOT EXISTS specification_segments (
+    grade TEXT NOT NULL, spec_revision INTEGER NOT NULL,
+    spec_id TEXT NOT NULL REFERENCES specifications(spec_id),
+    valid_from TEXT NOT NULL, valid_to TEXT,
+    PRIMARY KEY(grade, spec_revision, valid_from),
+    FOREIGN KEY(grade, spec_revision) REFERENCES specification_revisions(grade, spec_revision)
+);
+CREATE INDEX IF NOT EXISTS specification_segments_lookup
+    ON specification_segments(grade, spec_revision, valid_from, valid_to);
 CREATE TABLE IF NOT EXISTS lots (
     lot_id TEXT PRIMARY KEY, line_id TEXT NOT NULL REFERENCES lines(line_id),
     grade TEXT NOT NULL, produced_at TEXT NOT NULL, local_day TEXT NOT NULL,
@@ -69,13 +86,22 @@ CREATE TABLE IF NOT EXISTS candidates (
     candidate_id TEXT PRIMARY KEY, plant_id TEXT NOT NULL REFERENCES plants(plant_id),
     from_day TEXT NOT NULL, to_day TEXT NOT NULL, base_revision INTEGER NOT NULL,
     expected_head INTEGER NOT NULL, rows_json TEXT NOT NULL, rows_digest TEXT NOT NULL,
+    spec_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL CHECK(status IN ('prepared','published'))
 );
 CREATE TABLE IF NOT EXISTS publications (
     version INTEGER PRIMARY KEY, candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(candidate_id),
     plant_id TEXT NOT NULL, from_day TEXT NOT NULL, to_day TEXT NOT NULL,
     source_revision INTEGER NOT NULL, rows_digest TEXT NOT NULL,
+    spec_json TEXT NOT NULL DEFAULT '{}',
     published_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spec_amendments (
+    amendment_id TEXT PRIMARY KEY, grade TEXT NOT NULL,
+    from_spec_revision INTEGER, to_spec_revision INTEGER NOT NULL,
+    spec_id TEXT NOT NULL REFERENCES specifications(spec_id),
+    effective_from TEXT NOT NULL, reason TEXT NOT NULL,
+    impact_json TEXT NOT NULL, applied_revision INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS publication_rows (
     version INTEGER NOT NULL REFERENCES publications(version), day TEXT NOT NULL,
@@ -143,10 +169,69 @@ class Store:
         db = self.connect()
         try:
             db.executescript(SCHEMA)
+            self._migrate(db)
             if self.path != ":memory:":
                 db.execute("PRAGMA journal_mode=WAL")
         finally:
             db.close()
+
+    @staticmethod
+    def _columns(db, table: str) -> set[str]:
+        return {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate(self, db):
+        """Bring an existing database up to the current schema without touching data."""
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                         "AND name='specifications'").fetchone()
+        legacy = bool(sql and "UNIQUE(grade,valid_from)" in sql[0].replace(" ", ""))
+        if legacy:
+            db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for table in ("candidates", "publications"):
+                if "spec_json" not in self._columns(db, table):
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN spec_json TEXT NOT NULL DEFAULT '{{}}'")
+            # Older databases carried UNIQUE(grade,valid_from), which prevents a
+            # revised standard from starting on a day an old row already starts.
+            if legacy:
+                # Rebuild in place: renaming would rewrite the segment table's
+                # foreign key to the temporary name and leave it dangling.
+                rows = [tuple(row) for row in db.execute(
+                    "SELECT spec_id,grade,valid_from,valid_to,sulfur_min,sulfur_max,ash_max,"
+                    "created_revision FROM specifications")]
+                db.execute("DROP TABLE specifications")
+                db.execute("CREATE TABLE specifications ("
+                           "spec_id TEXT PRIMARY KEY, grade TEXT NOT NULL, valid_from TEXT NOT NULL,"
+                           "valid_to TEXT, sulfur_min TEXT NOT NULL, sulfur_max TEXT NOT NULL,"
+                           "ash_max TEXT NOT NULL, created_revision INTEGER NOT NULL)")
+                db.executemany("INSERT INTO specifications VALUES (?,?,?,?,?,?,?,?)", rows)
+            self._backfill_specification_revisions(db)
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            if legacy:
+                db.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def _backfill_specification_revisions(db):
+        """Seed revision 1 for catalogues created before revisions existed."""
+        grades = [row[0] for row in db.execute(
+            "SELECT DISTINCT grade FROM specifications WHERE grade NOT IN "
+            "(SELECT grade FROM specification_revisions) ORDER BY grade")]
+        for grade in grades:
+            db.execute("INSERT INTO specification_revisions VALUES (?,?,?,?,?,?,?,?)",
+                       (1, grade, None, "initial catalogue",
+                        db.execute("SELECT min(valid_from) FROM specifications WHERE grade=?",
+                                   (grade,)).fetchone()[0], "current",
+                        db.execute("SELECT min(created_revision) FROM specifications WHERE grade=?",
+                                   (grade,)).fetchone()[0],
+                        db.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')").fetchone()[0]))
+            for row in db.execute("SELECT * FROM specifications WHERE grade=? ORDER BY valid_from",
+                                  (grade,)):
+                db.execute("INSERT INTO specification_segments VALUES (?,?,?,?,?)",
+                           (grade, 1, row["spec_id"], row["valid_from"], row["valid_to"]))
 
     @contextmanager
     def read(self):

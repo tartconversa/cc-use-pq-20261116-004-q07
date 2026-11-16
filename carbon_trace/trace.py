@@ -1,6 +1,7 @@
 from .catalog import Catalog
 from .errors import require
 from .quality import Quality
+from .standards import decode
 from .store import Store
 from .values import identifier
 
@@ -41,7 +42,9 @@ class Trace:
             kind = audit["cause"]
             ref = audit["ref"]
             table = {"plant": ("plants", "plant_id"), "line": ("lines", "line_id"),
-                     "specification": ("specifications", "spec_id"), "lot": ("lots", "lot_id"),
+                     "specification": ("specifications", "spec_id"),
+                     "specification_amendment": ("spec_amendments", "amendment_id"),
+                     "lot": ("lots", "lot_id"),
                      "assay": ("assays", "assay_id"), "shipment": ("shipments", "shipment_id"),
                      "order": ("orders", "order_id"), "reservation": ("reservations", "reservation_id"),
                      "source_policy": ("source_policies", "source")}.get(kind)
@@ -49,6 +52,8 @@ class Trace:
             if table:
                 entity_row = db.execute(f"SELECT * FROM {table[0]} WHERE {table[1]}=?", (ref,)).fetchone()
                 entity = dict(entity_row) if entity_row else None
+                if entity and "impact_json" in entity:
+                    entity = decode(entity)
             return {"audit": dict(audit), "entity": entity,
                     "current_revision": Store.revision(db)}
 

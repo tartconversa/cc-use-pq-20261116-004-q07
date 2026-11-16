@@ -10,6 +10,7 @@ from .reconciliation import Reconciliation
 from .trace import Trace
 from .publication import Publication
 from .quality import Quality
+from .standards import Standards
 from .store import Store
 from .values import identifier, mapping
 
@@ -29,6 +30,7 @@ class Service:
         self.analytics = Analytics(self.store)
         self.publication = Publication(self.store)
         self.quality = Quality()
+        self.standards = Standards(self.store)
 
     def register_plant(self, payload: dict) -> dict:
         return self.catalog.add_plant(mapping(payload))
@@ -38,6 +40,22 @@ class Service:
 
     def register_specification(self, payload: dict) -> dict:
         return self.catalog.add_specification(mapping(payload))
+
+    def specification_timeline(self, grade: str) -> dict:
+        with self.store.read() as db:
+            return Standards.timeline(db, identifier(grade, "grade"))
+
+    def preview_amendment(self, grade: str, payload: dict) -> dict:
+        return self.standards.preview(grade, mapping(payload))
+
+    def amend_specification(self, grade: str, payload: dict) -> dict:
+        return self.standards.amend(grade, mapping(payload))
+
+    def amendment_history(self, grade: str) -> list[dict]:
+        return self.standards.history(grade)
+
+    def amendment(self, amendment_id: str) -> dict:
+        return self.standards.amendment(amendment_id)
 
     def ingest(self, payload: dict) -> dict:
         payload = mapping(payload)
@@ -51,6 +69,9 @@ class Service:
 
     def quality_of_lot(self, lot_id: str) -> dict:
         return self.quality.lot(self.store, identifier(lot_id, "lot_id"))
+
+    def reassess_lot(self, lot_id: str) -> dict:
+        return self.quality.reassess(self.store, identifier(lot_id, "lot_id"))
 
     def prepare(self, payload: dict) -> dict:
         payload = mapping(payload)

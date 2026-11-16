@@ -29,12 +29,17 @@ class Publication:
             rows = Analytics(self.store).calculate(db, plant_id, from_day, to_day)
             rows_json = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             rows_digest = digest(rows)
-            db.execute("INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?)",
+            spec = Catalog.timeline_snapshot(db, [row["grade"] for row in db.execute(
+                "SELECT DISTINCT lots.grade FROM lots JOIN lines ON lines.line_id=lots.line_id "
+                "WHERE lines.plant_id=? AND lots.local_day BETWEEN ? AND ?",
+                (plant_id, from_day, to_day))])
+            db.execute("INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?,?)",
                        (candidate_id, plant_id, from_day, to_day, expected_revision,
-                        expected_head, rows_json, rows_digest, "prepared"))
+                        expected_head, rows_json, rows_digest, json.dumps(spec, sort_keys=True),
+                        "prepared"))
             return {"candidate_id": candidate_id, "plant_id": plant_id,
                     "source_revision": expected_revision, "expected_head": expected_head,
-                    "rows_digest": rows_digest, "rows": rows}
+                    "rows_digest": rows_digest, "specifications": spec, "rows": rows}
 
     def publish(self, candidate_id: str, expected_head: int, expected_revision: int) -> dict:
         candidate_id = identifier(candidate_id, "candidate_id")
@@ -51,24 +56,34 @@ class Publication:
             rows = json.loads(candidate["rows_json"])
             if digest(rows) != candidate["rows_digest"]:
                 raise Conflict("candidate row digest mismatch")
+            spec = json.loads(candidate["spec_json"]) if candidate["spec_json"] else {}
+            current = Catalog.timeline_snapshot(db, list(spec))
+            if spec != current:
+                raise Stale("grade standard changed after candidate preparation; "
+                            "prepare a new candidate under the current standard",
+                            detail={"prepared_specifications": spec,
+                                    "current_specifications": current})
             version = expected_head + 1
             timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            db.execute("INSERT INTO publications VALUES (?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO publications VALUES (?,?,?,?,?,?,?,?,?)",
                        (version, candidate_id, candidate["plant_id"], candidate["from_day"],
-                        candidate["to_day"], expected_revision, candidate["rows_digest"], timestamp))
+                        candidate["to_day"], expected_revision, candidate["rows_digest"],
+                        json.dumps(spec, sort_keys=True), timestamp))
             db.executemany("INSERT INTO publication_rows VALUES (?,?,?)",
                            [(version, row["day"], json.dumps(row, ensure_ascii=False, sort_keys=True))
                             for row in rows])
             db.execute("UPDATE candidates SET status='published' WHERE candidate_id=?", (candidate_id,))
             db.execute("UPDATE state SET head=? WHERE singleton=1", (version,))
             return {"version": version, "candidate_id": candidate_id,
-                    "source_revision": expected_revision, "rows_digest": candidate["rows_digest"]}
+                    "source_revision": expected_revision, "rows_digest": candidate["rows_digest"],
+                    "specifications": spec}
 
     def candidate(self, candidate_id: str) -> dict:
         with self.store.read() as db:
             row = Store.one(db, "SELECT * FROM candidates WHERE candidate_id=?",
                             (identifier(candidate_id, "candidate_id"),), "candidate")
-            return {**dict(row), "rows": json.loads(row["rows_json"])}
+            return {**dict(row), "specifications": json.loads(row["spec_json"]),
+                    "rows": json.loads(row["rows_json"])}
 
     def version(self, version: int) -> dict:
         require(type(version) is int and version > 0, "invalid version")
@@ -78,7 +93,9 @@ class Publication:
                 "SELECT * FROM publication_rows WHERE version=? ORDER BY day", (version,))]
             if digest(rows) != row["rows_digest"]:
                 raise Conflict("stored publication digest mismatch")
-            return {**dict(row), "rows": rows, "summary": Analytics.summarize(rows)}
+            spec = json.loads(row["spec_json"]) if row["spec_json"] else {}
+            return {**dict(row), "specifications": spec, "rows": rows,
+                    "summary": Analytics.summarize(rows)}
 
     def versions(self, plant_id: str) -> list[dict]:
         plant_id = identifier(plant_id, "plant_id")

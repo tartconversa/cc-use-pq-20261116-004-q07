@@ -71,6 +71,9 @@ class Orders:
             quality = self.quality.classify(db, lot)
             if quality["status"] != "passed":
                 raise Invariant("lot must pass quality before reservation")
+            risk = self.quality.risk(db, lot, quality)
+            if risk["on_quality_hold"]:
+                raise Invariant("lot is on quality hold under the current standard")
             if db.execute("SELECT 1 FROM reservations WHERE reservation_id=?", (reservation_id,)).fetchone():
                 raise Conflict("reservation_id already exists")
             order_used = self._sum(db, "SELECT quantity FROM reservations WHERE order_id=? AND status='active'", order_id)
@@ -111,7 +114,22 @@ class Orders:
                 "SELECT * FROM reservations WHERE order_id=? ORDER BY created_revision", (order_id,))]
             active = sum((decimal(row["quantity"], "quantity") for row in reservations
                           if row["status"] == "active"), Decimal(0))
-            return {**dict(order), "reserved_tons": as_number(active), "reservations": reservations}
+            at_risk = []
+            for row in reservations:
+                if row["status"] != "active":
+                    continue
+                lot = db.execute("SELECT * FROM lots WHERE lot_id=?", (row["lot_id"],)).fetchone()
+                if lot is None:
+                    continue
+                classification = self.quality.classify(db, lot)
+                risk = self.quality.risk(db, lot, classification)
+                if risk["on_quality_hold"]:
+                    at_risk.append({"reservation_id": row["reservation_id"], "lot_id": row["lot_id"],
+                                    "quantity": row["quantity"],
+                                    "quality_status": classification["status"],
+                                    "flags": risk["flags"]})
+            return {**dict(order), "reserved_tons": as_number(active), "reservations": reservations,
+                    "at_risk_reservations": at_risk}
 
     def allocation(self, plant_id: str, as_of: str) -> dict:
         plant_id = identifier(plant_id, "plant_id")
@@ -121,13 +139,24 @@ class Orders:
             orders = db.execute("SELECT * FROM orders WHERE plant_id=? AND due_day<=? ORDER BY due_day,order_id",
                                 (plant_id, as_of)).fetchall()
             result = []
+            at_risk = 0
             for order in orders:
                 reserved = self._sum(db, "SELECT quantity FROM reservations WHERE order_id=? AND status='active'",
                                      order["order_id"])
+                risk_rows = db.execute(
+                    "SELECT reservations.quantity,lots.* FROM reservations JOIN lots "
+                    "ON lots.lot_id=reservations.lot_id WHERE reservations.order_id=? "
+                    "AND reservations.status='active'", (order["order_id"],)).fetchall()
+                risky = 0
+                for lot in risk_rows:
+                    if self.quality.risk(db, lot)["on_quality_hold"]:
+                        risky += 1
+                at_risk += risky
                 quantity = decimal(order["quantity"], "quantity")
                 result.append({"order_id": order["order_id"], "due_day": order["due_day"],
                                "grade": order["grade"], "status": order["status"],
                                "requested_tons": as_number(quantity), "reserved_tons": as_number(reserved),
-                               "unfilled_tons": as_number(quantity - reserved) if order["status"] == "open" else "0"})
+                               "unfilled_tons": as_number(quantity - reserved) if order["status"] == "open" else "0",
+                               "at_risk_reservations": risky})
             return {"plant_id": plant_id, "as_of": as_of, "source_revision": Store.revision(db),
-                    "orders": result}
+                    "orders": result, "at_risk_reservations": at_risk}

@@ -25,8 +25,13 @@ class Analytics:
         with self.store.read() as db:
             Catalog.plant(db, plant_id)
             rows = self.calculate(db, plant_id, from_day, to_day)
+            grades = [row[0] for row in db.execute(
+                "SELECT DISTINCT lots.grade FROM lots JOIN lines ON lines.line_id=lots.line_id "
+                "WHERE lines.plant_id=? AND lots.local_day BETWEEN ? AND ?",
+                (plant_id, from_day, to_day))]
             return {"plant_id": plant_id, "from_day": from_day, "to_day": to_day,
                     "source_revision": Store.revision(db), "rows": rows,
+                    "specifications": Catalog.timeline_snapshot(db, grades),
                     "summary": self.summarize(rows)}
 
     def calculate(self, db, plant_id: str, from_day: str, to_day: str) -> list[dict]:
@@ -110,13 +115,20 @@ class Analytics:
                 if remaining <= 0:
                     continue
                 quality = self.quality.classify(db, lot)
+                risk = self.quality.risk(db, lot, quality)
                 entries.append({"lot_id": lot["lot_id"], "grade": lot["grade"],
                                 "produced_day": lot["local_day"], "quantity": as_number(quantity),
                                 "shipped": as_number(shipped_tons), "remaining": as_number(remaining),
-                                "quality_status": quality["status"], "assay_id": quality["assay_id"]})
+                                "quality_status": quality["status"], "assay_id": quality["assay_id"],
+                                "spec_id": quality["spec_id"],
+                                "on_quality_hold": risk["on_quality_hold"],
+                                "risk_flags": risk["flags"]})
             total = sum((decimal(row["remaining"], "remaining") for row in entries), Decimal(0))
+            held = sum((decimal(row["remaining"], "remaining") for row in entries
+                        if row["on_quality_hold"]), Decimal(0))
             return {"plant_id": plant_id, "as_of": as_of, "source_revision": Store.revision(db),
-                    "remaining_tons": as_number(total), "lots": entries}
+                    "remaining_tons": as_number(total), "held_tons": as_number(held),
+                    "available_tons": as_number(total - held), "lots": entries}
 
     def compare(self, plant_id: str, from_day: str, to_day: str, version: int) -> dict:
         from .publication import Publication
@@ -126,13 +138,25 @@ class Analytics:
                 frozen["to_day"] == to_day, "version scope differs from live query")
         fields = ("capacity_tons", "production_tons", "shipped_tons")
         changes = []
+        standard_changes = []
+        for grade, old_spec in sorted(frozen.get("specifications", {}).items()):
+            new_spec = live.get("specifications", {}).get(grade)
+            if old_spec != new_spec:
+                standard_changes.append({"grade": grade,
+                                         "published_spec_revision": old_spec.get("spec_revision"),
+                                         "current_spec_revision": (new_spec or {}).get("spec_revision"),
+                                         "published_timeline": old_spec.get("segments", []),
+                                         "current_timeline": (new_spec or {}).get("segments", [])})
         for current, old in zip(live["rows"], frozen["rows"], strict=True):
             if current == old:
                 continue
+            quality_changed = (current["quality_counts"] != old["quality_counts"] or
+                               current["quality_tons"] != old["quality_tons"])
             changes.append({"day": current["day"],
                             "metric_deltas": {field: as_number(decimal(current[field], field) -
                                                                decimal(old[field], field)) for field in fields},
-                            "quality_changed": current["quality_counts"] != old["quality_counts"] or
-                            current["quality_tons"] != old["quality_tons"]})
+                            "quality_changed": quality_changed,
+                            "standard_revision_changed": bool(standard_changes)})
         return {"published_version": version, "published_revision": frozen["source_revision"],
-                "live_revision": live["source_revision"], "changes": changes}
+                "live_revision": live["source_revision"],
+                "standard_changes": standard_changes, "changes": changes}

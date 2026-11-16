@@ -63,15 +63,34 @@ class Catalog:
         with self.store.write() as db:
             if db.execute("SELECT 1 FROM specifications WHERE spec_id=?", (spec_id,)).fetchone():
                 raise Conflict("spec_id already exists")
-            intervals = db.execute("SELECT valid_from,valid_to FROM specifications WHERE grade=?",
-                                   (grade,)).fetchall()
-            for old in intervals:
+            current = db.execute("SELECT * FROM specification_revisions WHERE grade=? "
+                                 "AND status='current'", (grade,)).fetchone()
+            old_revision = current["spec_revision"] if current else 0
+            segments = (self.segments(db, grade, old_revision) if current else [])
+            for old in segments:
                 if (old["valid_to"] is None or first <= old["valid_to"]) and (last is None or old["valid_from"] <= last):
                     raise Conflict("grade specification periods overlap")
             revision = self.store.advance(db, "specification", spec_id)
             db.execute("INSERT INTO specifications VALUES (?,?,?,?,?,?,?,?)",
                        (spec_id, grade, first, last, as_number(low), as_number(high), as_number(ash), revision))
-            return {"spec_id": spec_id, "revision": revision}
+            spec_revision = old_revision + 1 if current else 1
+            if current:
+                db.execute("UPDATE specification_revisions SET status='superseded' "
+                           "WHERE grade=? AND status='current'", (grade,))
+            db.execute("INSERT INTO specification_revisions VALUES (?,?,?,?,?,?,?,?)",
+                       (spec_revision, grade, old_revision or None,
+                        "catalogue addition" if current else "initial catalogue",
+                        first if not current else
+                        db.execute("SELECT min(valid_from) FROM specification_segments WHERE grade=? "
+                                   "AND spec_revision=?", (grade, old_revision)).fetchone()[0],
+                        "current", revision,
+                        db.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')").fetchone()[0]))
+            db.executemany("INSERT INTO specification_segments VALUES (?,?,?,?,?)",
+                           [(grade, spec_revision, segment["spec_id"], segment["valid_from"],
+                             segment["valid_to"]) for segment in segments] +
+                           [(grade, spec_revision, spec_id, first, last)])
+            return {"spec_id": spec_id, "grade": grade, "revision": revision,
+                    "spec_revision": spec_revision}
 
     @staticmethod
     def plant(db, plant_id: str):
@@ -98,14 +117,41 @@ class Catalog:
 
     @staticmethod
     def specification(db, grade: str, local_day: str):
-        rows = db.execute("SELECT * FROM specifications WHERE grade=? AND valid_from<=? "
-                          "AND (valid_to IS NULL OR valid_to>=?) ORDER BY valid_from DESC",
+        rows = db.execute("SELECT s.spec_id,g.valid_from,g.valid_to,s.sulfur_min,s.sulfur_max,"
+                          "s.ash_max,s.created_revision,r.spec_revision AS timeline_revision "
+                          "FROM specifications s JOIN specification_segments g "
+                          "ON g.spec_id=s.spec_id AND g.grade=s.grade "
+                          "JOIN specification_revisions r ON r.grade=g.grade "
+                          "AND r.spec_revision=g.spec_revision AND r.status='current' "
+                          "WHERE s.grade=? AND g.valid_from<=? "
+                          "AND (g.valid_to IS NULL OR g.valid_to>=?) ORDER BY g.valid_from DESC",
                           (grade, local_day, local_day)).fetchall()
         if not rows:
             raise Missing("no specification for grade and day")
         if len(rows) != 1:
             raise Invariant("ambiguous grade specification")
         return rows[0]
+
+    @staticmethod
+    def segments(db, grade: str, spec_revision: int) -> list[dict]:
+        return [dict(row) for row in db.execute(
+            "SELECT s.spec_id, g.valid_from, g.valid_to, s.sulfur_min, s.sulfur_max, s.ash_max,"
+            "s.created_revision FROM specification_segments g JOIN specifications s "
+            "ON s.spec_id=g.spec_id WHERE g.grade=? AND g.spec_revision=? ORDER BY g.valid_from",
+            (grade, spec_revision))]
+
+    @staticmethod
+    def timeline(db, grade: str) -> dict:
+        current = db.execute("SELECT * FROM specification_revisions WHERE grade=? "
+                             "AND status='current'", (grade,)).fetchone()
+        if current is None:
+            raise Missing("no specification revision for grade")
+        revisions = [dict(row) for row in db.execute(
+            "SELECT * FROM specification_revisions WHERE grade=? ORDER BY spec_revision DESC",
+            (grade,))]
+        return {"grade": grade, "current": dict(current),
+                "segments": Catalog.segments(db, grade, current["spec_revision"]),
+                "revisions": revisions}
 
     def list_plants(self) -> list[dict]:
         with self.store.read() as db:
@@ -115,6 +161,18 @@ class Catalog:
         with self.store.read() as db:
             self.plant(db, identifier(plant_id, "plant_id"))
             return [dict(row) for row in db.execute("SELECT * FROM lines WHERE plant_id=? ORDER BY line_id", (plant_id,))]
+
+    @staticmethod
+    def timeline_snapshot(db, grades: list[str]) -> dict:
+        result = {}
+        for grade in sorted(set(grades)):
+            row = db.execute("SELECT * FROM specification_revisions WHERE grade=? "
+                             "AND status='current'", (grade,)).fetchone()
+            if row is None:
+                continue
+            result[grade] = {"spec_revision": row["spec_revision"],
+                             "segments": Catalog.segments(db, grade, row["spec_revision"])}
+        return result
 
     def list_specifications(self, grade: str) -> list[dict]:
         with self.store.read() as db:

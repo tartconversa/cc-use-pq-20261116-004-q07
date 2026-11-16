@@ -69,6 +69,26 @@ def create_app(database: str | None = None) -> FastAPI:
     def specifications(grade: str):
         return service.catalog.list_specifications(grade)
 
+    @app.get("/specifications/{grade}/timeline")
+    def specification_timeline(grade: str):
+        return service.specification_timeline(grade)
+
+    @app.post("/specifications/{grade}/amendments/preview")
+    def preview_amendment(grade: str, payload: Payload):
+        return service.preview_amendment(grade, payload.model_dump())
+
+    @app.post("/specifications/{grade}/amendments", status_code=201)
+    def amend_specification(grade: str, payload: Payload):
+        return service.amend_specification(grade, payload.model_dump())
+
+    @app.get("/specifications/{grade}/amendments")
+    def amendment_history(grade: str):
+        return service.amendment_history(grade)
+
+    @app.get("/amendments/{amendment_id}")
+    def amendment(amendment_id: str):
+        return service.amendment(amendment_id)
+
     @app.post("/batches")
     def ingest(payload: Ingestion):
         return service.ingest(payload.model_dump())
@@ -88,6 +108,10 @@ def create_app(database: str | None = None) -> FastAPI:
     @app.get("/lots/{lot_id}/quality")
     def lot_quality(lot_id: str):
         return service.quality_of_lot(lot_id)
+
+    @app.get("/lots/{lot_id}/quality/history")
+    def lot_quality_history(lot_id: str):
+        return service.reassess_lot(lot_id)
 
     @app.get("/plants/{plant_id}/report")
     def report(plant_id: str, from_day: str, to_day: str):
